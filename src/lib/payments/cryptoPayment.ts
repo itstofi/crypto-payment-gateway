@@ -1,5 +1,6 @@
 import crypto from 'crypto'
 import { createMockOrder } from './mockGateway'
+import { isDemoMode } from '@/lib/config'
 
 interface OrderRequest {
   amount: number
@@ -13,72 +14,108 @@ interface OrderResult {
 }
 
 interface BinancePayResponse {
-  status: string
-  code: string
+  status?: unknown
+  code?: unknown
   data?: {
-    prepayId: string
-    checkoutUrl: string
+    prepayId?: unknown
+    checkoutUrl?: unknown
   }
-  errorMessage?: string
+  errorMessage?: unknown
 }
 
-// Binance Pay uses HMAC-SHA512. The message format is fixed:
-// timestamp + newline + nonce + newline + body + newline.
+const BINANCE_ORDER_ENDPOINT = 'https://bpay.binanceapi.com/binancepay/openapi/v2/order'
+const BINANCE_CHECKOUT_ORIGINS = new Set([
+  'https://pay.binance.com',
+  'https://www.binance.com',
+])
+const BINANCE_FETCH_TIMEOUT_MS = 10_000
+
 function buildSignature(payload: string, timestamp: string, nonce: string, apiSecret: string): string {
   const message = `${timestamp}\n${nonce}\n${payload}\n`
   return crypto.createHmac('sha512', apiSecret).update(message).digest('hex').toUpperCase()
 }
 
-// Entry point for creating a payment order.
-// Uses real Binance Pay when credentials are configured, falls back to mock otherwise.
+function isExpectedBinanceCheckoutUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' && BINANCE_CHECKOUT_ORIGINS.has(url.origin)
+  } catch {
+    return false
+  }
+}
+
+function validateOrderResult(result: OrderResult, demoMode: boolean): OrderResult {
+  if (typeof result.prepayId !== 'string' || result.prepayId.trim() === '') {
+    throw new Error('Payment provider returned an invalid response')
+  }
+
+  const validCheckout = demoMode
+    ? result.checkoutUrl.startsWith('/mock-checkout?')
+    : isExpectedBinanceCheckoutUrl(result.checkoutUrl)
+  if (typeof result.checkoutUrl !== 'string' || !validCheckout) {
+    throw new Error('Payment provider returned an invalid response')
+  }
+
+  return result
+}
+
 export async function createPaymentOrder(params: OrderRequest): Promise<OrderResult> {
+  const demoMode = isDemoMode()
+  if (demoMode) return validateOrderResult(createMockOrder(params), true)
+
   const apiKey = process.env.BINANCE_PAY_API_KEY
   const apiSecret = process.env.BINANCE_PAY_API_SECRET
-
   if (!apiKey || !apiSecret) {
-    return createMockOrder(params)
+    throw new Error('Binance Pay credentials are required outside DEMO_MODE')
   }
 
   const timestamp = Date.now().toString()
   const nonce = crypto.randomBytes(16).toString('hex')
-
   const body = {
     env: { terminalType: 'WEB' },
     merchantTradeNo: params.referenceId,
     orderAmount: params.amount.toFixed(2),
     currency: params.currency,
     goods: {
-      goodsType: '02',       // '02' = digital goods, required by Binance Pay
+      goodsType: '02',
       goodsCategory: 'Z000',
       referenceGoodsId: params.referenceId,
       goodsName: 'Crypto Payment',
     },
   }
-
   const payload = JSON.stringify(body)
   const signature = buildSignature(payload, timestamp, nonce, apiSecret)
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), BINANCE_FETCH_TIMEOUT_MS)
 
-  const response = await fetch('https://bpay.binanceapi.com/binancepay/openapi/v2/order', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'BinancePay-Timestamp': timestamp,
-      'BinancePay-Nonce': nonce,
-      'BinancePay-Certificate-SN': apiKey,
-      'BinancePay-Signature': signature,
-    },
-    body: payload,
-  })
+  try {
+    const response = await fetch(BINANCE_ORDER_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'BinancePay-Timestamp': timestamp,
+        'BinancePay-Nonce': nonce,
+        'BinancePay-Certificate-SN': apiKey,
+        'BinancePay-Signature': signature,
+      },
+      body: payload,
+      signal: controller.signal,
+    })
 
-  // Binance returns HTTP 200 even on failure — check the status field
-  const result: BinancePayResponse = await response.json()
+    const result = await response.json() as BinancePayResponse
+    if (!response.ok || result.status !== 'SUCCESS' || !result.data) {
+      const providerMessage = typeof result.errorMessage === 'string' ? result.errorMessage : undefined
+      throw new Error(providerMessage || 'Binance Pay order creation failed')
+    }
 
-  if (result.status !== 'SUCCESS' || !result.data) {
-    throw new Error(result.errorMessage || 'Binance Pay order creation failed')
-  }
-
-  return {
-    checkoutUrl: result.data.checkoutUrl,
-    prepayId: result.data.prepayId,
+    return validateOrderResult({
+      checkoutUrl: result.data.checkoutUrl as string,
+      prepayId: result.data.prepayId as string,
+    }, false)
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('Binance Pay request timed out')
+    throw error
+  } finally {
+    clearTimeout(timeout)
   }
 }

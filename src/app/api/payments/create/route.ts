@@ -1,57 +1,81 @@
 import { NextRequest, NextResponse } from 'next/server'
 import crypto from 'crypto'
-import { serverSupabase } from '@/lib/supabase/server'
 import { createPaymentOrder } from '@/lib/payments/cryptoPayment'
+import { getPaymentRepository, type PaymentRepository } from '@/lib/payments/repository'
+import { consumeRateLimit } from '@/lib/security/rateLimit'
+import { isDemoMode } from '@/lib/config'
+
+const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' }
+
+function json(body: unknown, status = 200, headers: Record<string, string> = {}) {
+  return NextResponse.json(body, {
+    status,
+    headers: { ...NO_STORE_HEADERS, ...headers },
+  })
+}
+
+function isValidAmount(amount: unknown): amount is number {
+  return typeof amount === 'number'
+    && Number.isFinite(amount)
+    && amount >= 0.01
+    && Number(amount.toFixed(2)) === amount
+}
 
 export async function POST(req: NextRequest) {
+  let repository: PaymentRepository | undefined
+  let insertedPaymentId: string | undefined
+
   try {
+    const rateLimit = consumeRateLimit(req, 'payment-create', 20)
+    if (!rateLimit.allowed) {
+      return json(
+        { error: 'Too many requests' },
+        429,
+        { 'Retry-After': String(rateLimit.retryAfterSeconds) },
+      )
+    }
+
+    const demoMode = isDemoMode()
     const { amount, currency = 'USDT' } = await req.json()
 
-    if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
-      return NextResponse.json({ error: 'Invalid amount' }, { status: 400 })
+    if (!isValidAmount(amount)) {
+      return json({ error: 'Invalid amount' }, 400)
     }
 
-    if (Number(amount) > 100000) {
-      return NextResponse.json({ error: 'Amount exceeds maximum limit' }, { status: 400 })
+    if (amount > 100000) {
+      return json({ error: 'Amount exceeds maximum limit' }, 400)
     }
 
-    const parsedAmount = parseFloat(Number(amount).toFixed(2))
+    if (currency !== 'USDT') {
+      return json({ error: 'Unsupported currency' }, 400)
+    }
+
     const referenceId = crypto.randomBytes(12).toString('hex').toUpperCase()
+    repository = getPaymentRepository()
+    const payment = await repository.create({
+      amount,
+      currency,
+      payment_provider: demoMode ? 'demo' : 'binance_pay',
+      transaction_reference: referenceId,
+    })
+    insertedPaymentId = payment.id
 
-    // Insert the DB record before calling the payment provider.
-    // This way we always have a record to reference if the provider call fails.
-    const { data: payment, error: insertError } = await serverSupabase
-      .from('payments')
-      .insert({
-        amount: parsedAmount,
-        currency,
-        status: 'pending',
-        payment_provider: 'binance_pay',
-        transaction_reference: referenceId,
-      })
-      .select()
-      .single()
+    const order = await createPaymentOrder({ amount, currency, referenceId })
+    await repository.updateReference(payment.id, order.prepayId)
 
-    if (insertError || !payment) {
-      console.error('Supabase insert error:', insertError)
-      return NextResponse.json({ error: 'Failed to create payment record' }, { status: 500 })
-    }
-
-    const order = await createPaymentOrder({ amount: parsedAmount, currency, referenceId })
-
-    // Replace the temp referenceId with the actual prepayId from Binance
-    await serverSupabase
-      .from('payments')
-      .update({ transaction_reference: order.prepayId })
-      .eq('id', payment.id)
-
-    return NextResponse.json({
+    return json({
       paymentId: payment.id,
       checkoutUrl: order.checkoutUrl,
-      prepayId: order.prepayId,
     })
-  } catch (err) {
-    console.error('Payment creation error:', err)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  } catch (error) {
+    if (repository && insertedPaymentId) {
+      try {
+        await repository.updateStatus(insertedPaymentId, 'failed')
+      } catch (cleanupError) {
+        console.error('Failed to mark incomplete payment as failed:', cleanupError)
+      }
+    }
+    console.error('Payment creation error:', error)
+    return json({ error: 'Internal server error' }, 500)
   }
 }

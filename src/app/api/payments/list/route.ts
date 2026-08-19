@@ -1,29 +1,38 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { serverSupabase } from '@/lib/supabase/server'
+import { getPaymentRepository } from '@/lib/payments/repository'
+import { hasAdminAccess } from '@/lib/security/adminAuth'
+import { consumeRateLimit } from '@/lib/security/rateLimit'
 import type { PaymentStatus } from '@/types/payment'
 
 const VALID_STATUSES: PaymentStatus[] = ['pending', 'paid', 'failed']
+const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' }
 
-// GET /api/payments/list?status=<pending|paid|failed>
-// Returns all payments, ordered newest first. Used by the admin dashboard.
+function json(body: unknown, status = 200, headers: Record<string, string> = {}) {
+  return NextResponse.json(body, {
+    status,
+    headers: { ...NO_STORE_HEADERS, ...headers },
+  })
+}
+
 export async function GET(req: NextRequest) {
-  const statusParam = req.nextUrl.searchParams.get('status') as PaymentStatus | null
+  try {
+    const rateLimit = consumeRateLimit(req, 'payment-admin-list', 10)
+    if (!rateLimit.allowed) {
+      return json(
+        { error: 'Too many requests' },
+        429,
+        { 'Retry-After': String(rateLimit.retryAfterSeconds) },
+      )
+    }
 
-  let query = serverSupabase
-    .from('payments')
-    .select('*')
-    .order('created_at', { ascending: false })
+    if (!hasAdminAccess(req)) return json({ error: 'Unauthorized' }, 401)
 
-  if (statusParam && VALID_STATUSES.includes(statusParam)) {
-    query = query.eq('status', statusParam)
-  }
-
-  const { data, error } = await query
-
-  if (error) {
+    const statusParam = req.nextUrl.searchParams.get('status') as PaymentStatus | null
+    const status = statusParam && VALID_STATUSES.includes(statusParam) ? statusParam : undefined
+    const payments = await getPaymentRepository().list(status)
+    return json(payments)
+  } catch (error) {
     console.error('Failed to fetch payments:', error)
-    return NextResponse.json({ error: 'Failed to fetch payments' }, { status: 500 })
+    return json({ error: 'Failed to fetch payments' }, 500)
   }
-
-  return NextResponse.json(data ?? [])
 }

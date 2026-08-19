@@ -1,74 +1,63 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
-import type { Payment } from '@/types/payment'
+import type { CustomerPaymentStatus } from '@/types/payment'
 import { formatCurrency } from '@/lib/utils/formatCurrency'
 import { formatDate } from '@/lib/utils/formatDate'
-
-const STATUS_CONFIG = {
-  pending: {
-    icon: '○',
-    label: 'Payment Pending',
-    description: 'Waiting for confirmation from Binance Pay.',
-    color: 'text-yellow-400',
-    bg: 'bg-yellow-400/10 border-yellow-400/30',
-  },
-  paid: {
-    icon: '✓',
-    label: 'Payment Successful',
-    description: 'Your payment has been confirmed.',
-    color: 'text-green-400',
-    bg: 'bg-green-400/10 border-green-400/30',
-  },
-  failed: {
-    icon: '✕',
-    label: 'Payment Failed',
-    description: 'The payment could not be completed.',
-    color: 'text-red-400',
-    bg: 'bg-red-400/10 border-red-400/30',
-  },
-}
+import { getPaymentStatusPresentation, LatestRequestCoordinator } from '@/lib/payments/paymentStatus'
 
 interface PaymentStatusCardProps {
   paymentId: string
 }
 
 export function PaymentStatusCard({ paymentId }: PaymentStatusCardProps) {
-  const [payment, setPayment] = useState<Payment | null>(null)
+  const [payment, setPayment] = useState<CustomerPaymentStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
+  const requests = useRef(new LatestRequestCoordinator())
 
   const fetchStatus = useCallback(async (showRefreshing = false) => {
+    const request = requests.current.begin()
     if (showRefreshing) setRefreshing(true)
+
     try {
-      const res = await fetch(`/api/payments/status?paymentId=${paymentId}`)
+      const res = await fetch(`/api/payments/status?paymentId=${encodeURIComponent(paymentId)}`, {
+        signal: request.signal,
+        cache: 'no-store',
+      })
       if (!res.ok) throw new Error('Payment not found')
-      const data: Payment = await res.json()
+      const data: CustomerPaymentStatus = await res.json()
+      if (!requests.current.isCurrent(request.id)) return
       setPayment(data)
+      setError('')
     } catch {
-      setError('Could not load payment status.')
+      if (!request.signal.aborted && requests.current.isCurrent(request.id)) {
+        setError('Could not load payment status.')
+      }
     } finally {
-      setLoading(false)
-      setRefreshing(false)
+      if (requests.current.isCurrent(request.id)) {
+        setLoading(false)
+        setRefreshing(false)
+      }
     }
   }, [paymentId])
 
   useEffect(() => {
-    fetchStatus()
-
-    // Poll every 5 seconds while pending so the page updates automatically
-    // after the user confirms in Binance Pay without a manual refresh
-    const interval = setInterval(() => {
-      setPayment((prev) => {
-        if (prev?.status === 'pending') fetchStatus()
-        return prev
-      })
-    }, 5000)
-
-    return () => clearInterval(interval)
+    const coordinator = requests.current
+    const initialFetch = window.setTimeout(() => void fetchStatus(), 0)
+    return () => {
+      window.clearTimeout(initialFetch)
+      coordinator.cancel()
+    }
   }, [fetchStatus])
+
+  useEffect(() => {
+    if (payment?.status !== 'pending') return
+    const interval = window.setInterval(() => void fetchStatus(), 5000)
+    return () => window.clearInterval(interval)
+  }, [fetchStatus, payment?.status])
 
   if (loading) {
     return (
@@ -93,7 +82,7 @@ export function PaymentStatusCard({ paymentId }: PaymentStatusCardProps) {
     )
   }
 
-  const config = STATUS_CONFIG[payment.status]
+  const config = getPaymentStatusPresentation(payment.status, payment.provider)
 
   return (
     <div className="bg-gray-900 rounded-2xl p-8 border border-gray-800 text-center">
@@ -106,9 +95,8 @@ export function PaymentStatusCard({ paymentId }: PaymentStatusCardProps) {
 
       <div className="space-y-0 text-sm text-left mb-6">
         <DetailRow label="Amount" value={formatCurrency(payment.amount, payment.currency)} />
-        <DetailRow label="Provider" value="Binance Pay" />
-        <DetailRow label="Reference" value={payment.transaction_reference ?? '—'} mono />
-        <DetailRow label="Created" value={formatDate(payment.created_at)} />
+        <DetailRow label="Provider" value={config.providerLabel} />
+        <DetailRow label="Created" value={formatDate(payment.createdAt)} />
         <DetailRow label="Payment ID" value={payment.id} mono truncate />
       </div>
 

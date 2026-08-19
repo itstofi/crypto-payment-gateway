@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Header } from '@/components/layout/Header'
 import { PageContainer } from '@/components/layout/PageContainer'
 import { AdminStatsCards } from '@/components/admin/AdminStatsCards'
@@ -24,23 +24,32 @@ export default function AdminPage() {
   const [payments, setPayments] = useState<Payment[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [adminKey, setAdminKey] = useState('')
 
-  async function fetchPayments() {
+  const fetchPayments = useCallback(async (key: string) => {
+    setLoading(true)
+    setError('')
     try {
-      const res = await fetch('/api/payments/list')
+      const res = await fetch('/api/payments/list', {
+        headers: key ? { Authorization: `Bearer ${key}` } : undefined,
+      })
+      if (res.status === 401) throw new Error('unauthorized')
       if (!res.ok) throw new Error('Failed to fetch')
       const data: Payment[] = await res.json()
       setPayments(data)
-    } catch {
-      setError('Could not load payments. Check your Supabase connection.')
+    } catch (fetchError) {
+      setError(fetchError instanceof Error && fetchError.message === 'unauthorized'
+        ? 'Production mode requires a valid admin API key.'
+        : 'Could not load payments.')
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
-    fetchPayments()
-  }, [])
+    const timeout = window.setTimeout(() => void fetchPayments(''), 0)
+    return () => window.clearTimeout(timeout)
+  }, [fetchPayments])
 
   const stats = computeStats(payments)
 
@@ -51,14 +60,25 @@ export default function AdminPage() {
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-xl font-semibold text-white">Admin Dashboard</h1>
-            <p className="text-gray-500 text-sm mt-0.5">Payment records from Supabase</p>
+            <p className="text-gray-500 text-sm mt-0.5">Demo or production payment records</p>
           </div>
-          <button
-            onClick={fetchPayments}
-            className="text-xs text-gray-400 border border-gray-700 px-3 py-1.5 rounded-lg hover:border-yellow-400/50 hover:text-white transition-colors"
-          >
-            Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <input
+              type="password"
+              value={adminKey}
+              onChange={(event) => setAdminKey(event.target.value)}
+              placeholder="Admin API key (production)"
+              aria-label="Admin API key"
+              autoComplete="off"
+              className="w-52 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder:text-gray-600 focus:outline-none focus:border-yellow-400/50"
+            />
+            <button
+              onClick={() => void fetchPayments(adminKey)}
+              className="text-xs text-gray-400 border border-gray-700 px-3 py-1.5 rounded-lg hover:border-yellow-400/50 hover:text-white transition-colors"
+            >
+              Refresh
+            </button>
+          </div>
         </div>
 
         {loading ? (

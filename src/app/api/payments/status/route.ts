@@ -1,51 +1,77 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { serverSupabase } from '@/lib/supabase/server'
+import { getPaymentRepository } from '@/lib/payments/repository'
+import { consumeRateLimit } from '@/lib/security/rateLimit'
+import type { PaymentStatus } from '@/types/payment'
+import { isDemoMode } from '@/lib/config'
 
-// GET /api/payments/status?paymentId=<uuid>
-export async function GET(req: NextRequest) {
-  const paymentId = req.nextUrl.searchParams.get('paymentId')
+const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' }
 
-  if (!paymentId) {
-    return NextResponse.json({ error: 'paymentId is required' }, { status: 400 })
-  }
-
-  const { data: payment, error } = await serverSupabase
-    .from('payments')
-    .select('id, amount, currency, status, payment_provider, transaction_reference, created_at')
-    .eq('id', paymentId)
-    .single()
-
-  if (error || !payment) {
-    return NextResponse.json({ error: 'Payment not found' }, { status: 404 })
-  }
-
-  return NextResponse.json(payment)
+function json(body: unknown, status = 200, headers: Record<string, string> = {}) {
+  return NextResponse.json(body, {
+    status,
+    headers: { ...NO_STORE_HEADERS, ...headers },
+  })
 }
 
-// PATCH /api/payments/status
-// Used by the mock checkout page to simulate payment resolution.
-// In a real integration this would be replaced by a signed Binance Pay webhook.
+export async function GET(req: NextRequest) {
+  try {
+    const rateLimit = consumeRateLimit(req, 'payment-status-read', 60)
+    if (!rateLimit.allowed) {
+      return json(
+        { error: 'Too many requests' },
+        429,
+        { 'Retry-After': String(rateLimit.retryAfterSeconds) },
+      )
+    }
+
+    const paymentId = req.nextUrl.searchParams.get('paymentId')
+    if (!paymentId) return json({ error: 'paymentId is required' }, 400)
+
+    const payment = await getPaymentRepository().findById(paymentId)
+    if (!payment) return json({ error: 'Payment not found' }, 404)
+
+    return json({
+      id: payment.id,
+      amount: payment.amount,
+      currency: payment.currency,
+      status: payment.status,
+      provider: payment.payment_provider === 'demo' ? 'demo' : 'binance_pay',
+      createdAt: payment.created_at,
+    })
+  } catch (error) {
+    console.error('Payment lookup error:', error)
+    return json({ error: 'Failed to fetch payment' }, 500)
+  }
+}
+
 export async function PATCH(req: NextRequest) {
   try {
-    const { paymentId, status } = await req.json()
-
-    if (!paymentId || !['paid', 'failed'].includes(status)) {
-      return NextResponse.json({ error: 'Invalid request' }, { status: 400 })
+    const rateLimit = consumeRateLimit(req, 'payment-status-update', 20)
+    if (!rateLimit.allowed) {
+      return json(
+        { error: 'Too many requests' },
+        429,
+        { 'Retry-After': String(rateLimit.retryAfterSeconds) },
+      )
     }
 
-    const { data, error } = await serverSupabase
-      .from('payments')
-      .update({ status })
-      .eq('id', paymentId)
-      .select('id, status')
-      .single()
-
-    if (error || !data) {
-      return NextResponse.json({ error: 'Update failed' }, { status: 500 })
+    if (!isDemoMode()) {
+      return json({ error: 'Mock status updates are disabled' }, 403)
     }
 
-    return NextResponse.json(data)
-  } catch {
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    const { paymentId, status } = await req.json() as {
+      paymentId?: string
+      status?: PaymentStatus
+    }
+    if (!paymentId || !status || !['paid', 'failed'].includes(status)) {
+      return json({ error: 'Invalid request' }, 400)
+    }
+
+    const payment = await getPaymentRepository().updateStatus(paymentId, status)
+    if (!payment) return json({ error: 'Payment not found' }, 404)
+    return json({ id: payment.id, status: payment.status })
+  } catch (error) {
+    console.error('Payment update error:', error)
+    return json({ error: 'Internal server error' }, 500)
   }
 }
