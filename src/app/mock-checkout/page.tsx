@@ -79,7 +79,7 @@ function MockCheckoutContent() {
         </div>
 
         <p className="text-center text-xs text-gray-700 mt-4">
-          Mock mode · Binance Pay credentials not configured
+          Demo mode · no real transaction
         </p>
       </div>
     </main>

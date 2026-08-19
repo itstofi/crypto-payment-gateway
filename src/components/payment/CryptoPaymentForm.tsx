@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { navigateToTrustedCheckout } from '@/lib/payments/checkoutNavigation'
 
 const PRESET_AMOUNTS = [10, 25, 50, 100, 250]
 
@@ -39,14 +40,12 @@ export function CryptoPaymentForm() {
       }
 
       setStep('redirect')
-
-      // Local URL means mock mode, absolute URL means real Binance Pay
-      if (data.checkoutUrl.startsWith('/')) {
-        router.push(`${data.checkoutUrl}&paymentId=${data.paymentId}`)
-      } else {
-        window.open(data.checkoutUrl, '_blank')
-        router.push(`/payment/${data.paymentId}`)
-      }
+      navigateToTrustedCheckout(
+        data.checkoutUrl,
+        data.paymentId,
+        router.push,
+        (url, target, features) => window.open(url, target, features),
+      )
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong')
       setStep('form')

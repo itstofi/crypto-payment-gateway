@@ -17,7 +17,7 @@ export default function PaymentPage() {
           </div>
           <CryptoPaymentForm />
           <p className="text-center text-xs text-gray-600 mt-4">
-            Payments processed securely · Records stored in Supabase
+            Payments handled server-side · Demo and production modes are isolated
           </p>
         </div>
       </main>

@@ -1,4 +1,14 @@
 export type PaymentStatus = 'pending' | 'paid' | 'failed'
+export type CustomerPaymentProvider = 'demo' | 'binance_pay'
+
+export interface CustomerPaymentStatus {
+  id: string
+  amount: number
+  currency: string
+  status: PaymentStatus
+  provider: CustomerPaymentProvider
+  createdAt: string
+}
 
 export interface Payment {
   id: string
